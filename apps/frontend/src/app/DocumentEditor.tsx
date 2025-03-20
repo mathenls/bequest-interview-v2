@@ -10,15 +10,21 @@ import {
   ContentChangeEventArgs
 } from '@syncfusion/ej2-react-documenteditor';
 import { registerLicense } from '@syncfusion/ej2-base';
-import { useState, useRef, useEffect, useContext } from 'react';
+import { useState, useRef, useEffect, useContext, useMemo } from 'react';
 import { Sidebar } from './components/Sidebar';
 import { ClauseSelector } from './components/ClauseSelector';
 import { ClauseRemovalToolbar } from './components/ClauseRemovalToolbar';
 import { clauses } from '../assets/Clauses';
 import { 
-  getClauseFilePath, 
   ClauseInfo
 } from '../utils/docxReader';
+import {
+  generateBookmarkId,
+  fetchDocument,
+  convertDocxToSfdt,
+  insertFormattedText,
+  createFormattedHtml
+} from '../utils/documentUtils';
 
 // Style imports
 import '@syncfusion/ej2-base/styles/material.css';
@@ -44,13 +50,6 @@ interface ActionItem {
   title: string;
 }
 
-/**
- * Generates a unique bookmark ID for a clause
- */
-function generateBookmarkId(clauseId: string): string {
-  return `clause_${clauseId}`;
-}
-
 export const DocumentEditor = () => {
   const [isClauseSelectorOpen, setIsClauseSelectorOpen] = useState(false);
   const documentEditorRef = useRef<DocumentEditorContainerComponent>(null);
@@ -61,32 +60,11 @@ export const DocumentEditor = () => {
   // Track added clauses
   const { clauses: addedClauses, setClauses: setAddedClauses } = useContext(DocumentContext);
   
-  const [actionItems] = useState<ActionItem[]>([
+  // Memoize action items array to prevent unnecessary re-renders
+  const actionItems = useMemo<ActionItem[]>(() => [
     { id: '1', title: 'Add Clauses' },
     { id: '2', title: 'Save' },
-  ]);
-
-  // Initialize document settings when component mounts
-  useEffect(() => {
-    if (documentEditorRef.current) {
-      // Enable bookmark visibility to help with debugging
-      documentEditorRef.current.documentEditorSettings.showBookmarks = true;
-
-      // Set up content change listener
-      documentEditorRef.current.documentEditor.contentChange = handleDocumentContentChange;
-
-      // Set up document open listener
-      documentEditorRef.current.documentEditor.documentChange = () => {
-        // When a document is opened, detect existing clauses
-        setTimeout(() => {
-          detectClausesFromBookmarks();
-        }, 500);
-      };
-      
-      // Try to load the latest document
-      loadLatestDocument();
-    }
-  }, []);
+  ], []);
 
   /**
    * Detects clauses from existing bookmarks in the document
@@ -159,10 +137,7 @@ export const DocumentEditor = () => {
     
     try {
       setIsSaving(true);
-      
-      // Export the document as a blob
       const blob = await documentEditorRef.current.documentEditor.saveAsBlob('Docx');
-      console.log('Document exported as blob:', blob.size, 'bytes');
       
       // Create a FormData object and append the file
       const formData = new FormData();
@@ -175,8 +150,6 @@ export const DocumentEditor = () => {
         method: 'POST',
         body: formData
       });
-      
-      console.log('Server response status:', response.status);
       
       if (response.ok) {
         const result = await response.json();
@@ -195,24 +168,8 @@ export const DocumentEditor = () => {
     }
   };
 
-  // Add a periodic bookmark check to ensure sync
-  useEffect(() => {
-    // Skip this effect if no clauses are added yet
-    if (addedClauses.length === 0) return;
-
-    // Create an interval to periodically check bookmarks consistency
-    const intervalId = setInterval(() => {
-      syncBookmarksWithState();
-    }, 3000); // Check every 3 seconds
-    
-    // Cleanup the interval when component unmounts or clauses change
-    return () => clearInterval(intervalId);
-  }, [addedClauses.length]); // Only recreate when the number of clauses changes
-
   /**
    * Synchronizes the document bookmarks with the React state bookmarks
-   * This ensures that if a bookmark is deleted in the document editor,
-   * it's also removed from the tracked clauses in the React state
    */
   const syncBookmarksWithState = () => {
     if (!documentEditorRef.current) return;
@@ -251,7 +208,6 @@ export const DocumentEditor = () => {
 
   /**
    * Handles document content change events
-   * @param args The content change event arguments
    */
   const handleDocumentContentChange = (args: ContentChangeEventArgs) => {
     // Use a timeout to ensure we check after the document has been fully updated
@@ -260,86 +216,18 @@ export const DocumentEditor = () => {
     }, 100);
   };
 
-  /**
-   * Fetches a document file from the specified URL
-   * @param url The URL to fetch the document from
-   * @returns A Promise that resolves to a Blob
-   */
-  const fetchDocument = async (url: string): Promise<Blob> => {
-    const response = await fetch(url);
-    if (!response.ok) {
-      throw new Error('Network response was not ok');
-    }
-    return response.blob();
-  };
-
-  /**
-   * Converts a DOCX file to SFDT format using Syncfusion service
-   * @param blob The DOCX file as a Blob
-   * @param serviceUrl The Syncfusion service URL
-   * @returns A Promise that resolves to the SFDT data
-   */
-  const convertDocxToSfdt = async (blob: Blob, serviceUrl: string): Promise<any> => {
-    const formData = new FormData();
-    formData.append('files', blob, 'clause.docx');
-    
-    const response = await fetch(`${serviceUrl}Import`, {
-      method: 'POST',
-      body: formData
-    });
-    
-    return response.json();
-  };
-
-  /**
-   * Inserts formatted HTML text at the current cursor position by converting it to SFDT
-   * @param html The HTML string to insert
-   * @param serviceUrl The Syncfusion service URL
-   * @returns A Promise that resolves to the SFDT data
-   */
-  const insertFormattedText = async (html: string, serviceUrl: string): Promise<any> => {
-    const response = await fetch(`${serviceUrl}SystemClipboard`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ content: html, type: '.html' })
-    });
-    
-    return response.json();
-  };
-
-  /**
-   * Creates an HTML string with the specified text and formatting
-   * @param text The text to format
-   * @param underline Whether to apply underline formatting
-   * @param uppercase Whether to convert text to uppercase
-   * @returns An HTML string with the formatted text
-   */
-  const createFormattedHtml = (text: string, underline: boolean = false, uppercase: boolean = false): string => {
-    let formattedText = text;
-    
-    if (uppercase) {
-      formattedText = formattedText.toUpperCase();
-    }
-    
-    let html = `<p>${underline ? `<u>${formattedText}</u>` : formattedText}</p>`;
-    return html;
-  };
-
   const handleActionItemClick = (item: ActionItem) => {
     console.log('Action item clicked:', item);
     
-    // Open the clause selector when the "Add Clauses" button is clicked
     if (item.id === '1') {
       setIsClauseSelectorOpen(true);
     } else if (item.id === '2') {
-      // Save the document when the "Save" button is clicked
       saveDocument();
     }
   };
 
   /**
    * Directly adds a bookmark using Syncfusion's API
-   * @param name The name of the bookmark
    */
   const addBookmarkAtCursor = (name: string) => {
     if (!documentEditorRef.current) return;
@@ -350,8 +238,6 @@ export const DocumentEditor = () => {
 
   /**
    * Handles removing a clause from the document
-   * @param clauseId The ID of the clause to remove
-   * @param bookmarkId The bookmark ID for locating the clause in the document
    */
   const handleRemoveClause = async (clauseId: string, bookmarkId: string) => {
     if (!documentEditorRef.current) return;
@@ -361,29 +247,23 @@ export const DocumentEditor = () => {
     const documentEditor = documentEditorRef.current.documentEditor;
     
     try {
-      // Make sure bookmarks are visible
-      documentEditorRef.current.documentEditorSettings.showBookmarks = true;
-      
-      // Log all available bookmarks for debugging
       const bookmarks = documentEditor.getBookmarks();
-      console.log('Available bookmarks:', bookmarks);
       
-      // Check if the bookmark exists
       if (bookmarks.includes(bookmarkId)) {
         documentEditor.selection.selectBookmark(bookmarkId);
         
-        // Delete the selection (the content inside the bookmark)
+        console.log('Selected bookmark content range:', 
+          documentEditor.selection.start, documentEditor.selection.end);
+        
+        // Delete just the selected content (the content inside the bookmark)
         documentEditor.editor.delete();
         documentEditor.editor.deleteBookmark(bookmarkId);
-
-        documentEditor.selection.moveToDocumentEnd();
         
         // Update the state to remove the clause
         setAddedClauses(prevClauses => 
           prevClauses.filter(clause => clause.bookmarkId !== bookmarkId)
         );
         
-        // Verify the bookmark was actually removed
         setTimeout(() => {
           const updatedBookmarks = documentEditor.getBookmarks();
           if (updatedBookmarks.includes(bookmarkId)) {
@@ -418,38 +298,38 @@ export const DocumentEditor = () => {
     const documentEditor = documentEditorRef.current.documentEditor;
     
     try {
-      // Generate a unique bookmark ID for this clause
       const bookmarkId = generateBookmarkId(clauseId);
       console.log('Generated bookmark ID:', bookmarkId);
       
       const position = documentEditor.selection.startOffset.toString();
-      const bookmarks = documentEditor.getBookmarks();
+      const startPositionOffset = documentEditor.selection.startOffset;
       
-      if (!bookmarks.includes(bookmarkId)) {
-        addBookmarkAtCursor(bookmarkId);
-      }
-      
+      // 1. Insert the clause title (formatted)
       const formattedHtml = createFormattedHtml(clause.name, true, true);
       const sfdtData = await insertFormattedText(formattedHtml, documentEditor.serviceUrl);
-
-
       documentEditor.editor.paste(sfdtData);
       
-      // Insert a paragraph break
-      documentEditor.editor.insertText('\n\n');
-      const blob = await fetchDocument(clauseDocxPath);
+      // 2. Insert a paragraph break
+      documentEditor.editor.insertText('\n');
       
+      // 3. Insert the clause content
+      const blob = await fetchDocument(clauseDocxPath);
       const docxSfdtData = await convertDocxToSfdt(blob, documentEditor.serviceUrl);
       documentEditor.editor.paste(docxSfdtData);
       
-      // Verify the bookmark was actually created and still exists after content insertion
-      const updatedBookmarks = documentEditor.getBookmarks();
-      if (!updatedBookmarks.includes(bookmarkId)) {
-        console.warn(`Bookmark ${bookmarkId} was lost during content insertion, re-creating it`);
-        addBookmarkAtCursor(bookmarkId);
-      }
+      // Save where the clause content ends
+      const endPositionOffset = documentEditor.selection.startOffset;
       
-      // Add clause to tracked clauses
+      // 4. Insert a paragraph break after content (outside the bookmark)
+      documentEditor.editor.insertText('\n\n');
+      
+      // Select the exact content we want to bookmark
+      // First select from the start to end position using the precise hierarchical indices
+      documentEditor.selection.select(startPositionOffset, endPositionOffset);
+      documentEditor.editor.insertBookmark(bookmarkId);
+      
+      documentEditor.selection.moveToLineEnd();
+      
       const newClause: ClauseInfo = {
         id: clauseId,
         name: clause.name,
@@ -470,21 +350,70 @@ export const DocumentEditor = () => {
     }
   };
 
+  // Initialize document settings when component mounts
+  useEffect(() => {
+    if (documentEditorRef.current) {
+      documentEditorRef.current.documentEditor.contentChange = handleDocumentContentChange;
+
+      // Set up document open listener
+      documentEditorRef.current.documentEditor.documentChange = () => {
+        setTimeout(() => {
+          detectClausesFromBookmarks();
+        }, 500);
+      };
+      
+      loadLatestDocument();
+    }
+    // Intentionally omit dependencies to avoid infinite loops
+    // This effect should only run once on component mount
+  }, []);
+
+  useEffect(() => {
+    if (addedClauses.length === 0) return;
+
+    const intervalId = setInterval(() => {
+      syncBookmarksWithState();
+    }, 3000); 
+    
+    return () => clearInterval(intervalId);
+  }, [addedClauses.length]);
+
+  // Memoize the loading overlay
+  const loadingOverlay = useMemo(() => {
+    if (!(isLoadingClause || isSaving || isLoading)) return null;
+    
+    return (
+      <div className="absolute top-0 left-0 w-full h-full flex items-center justify-center bg-black bg-opacity-20 z-50">
+        <div className="bg-white p-4 rounded-lg shadow-lg">
+          <p className="text-gray-700">
+            {isLoadingClause ? 'Loading clause content...' : 
+             isSaving ? 'Saving document...' : 'Loading document...'}
+          </p>
+        </div>
+      </div>
+    );
+  }, [isLoadingClause, isSaving, isLoading]);
+
+  // Memoize the document editor toolbar items
+  const toolbarItems = useMemo(() => ([
+    'New',
+    'Open',
+    'Separator',
+    'Undo',
+    'Redo',
+    'Separator',
+    'Bookmark',
+    'Table',
+    'Separator',
+    'Find',
+  ] as any[]), []);
+
   return (
     <>
       <div className="flex h-screen bg-gray-300">
         <Sidebar items={actionItems} onItemClick={handleActionItemClick} />
         <div className="flex-1 px-6 pt-12 flex">
-          {(isLoadingClause || isSaving || isLoading) && (
-            <div className="absolute top-0 left-0 w-full h-full flex items-center justify-center bg-black bg-opacity-20 z-50">
-              <div className="bg-white p-4 rounded-lg shadow-lg">
-                <p className="text-gray-700">
-                  {isLoadingClause ? 'Loading clause content...' : 
-                   isSaving ? 'Saving document...' : 'Loading document...'}
-                </p>
-              </div>
-            </div>
-          )}
+          {loadingOverlay}
           <div className="flex-1">
             <DocumentEditorContainerComponent
               ref={documentEditorRef}
@@ -492,18 +421,7 @@ export const DocumentEditor = () => {
               serviceUrl="https://ej2services.syncfusion.com/production/web-services/api/documenteditor/"
               enableToolbar={true}
               showPropertiesPane={false}
-              toolbarItems={[
-                'New',
-                'Open',
-                'Separator',
-                'Undo',
-                'Redo',
-                'Separator',
-                'Bookmark',
-                'Table',
-                'Separator',
-                'Find',
-              ]}
+              toolbarItems={toolbarItems}
             />
           </div>
           
